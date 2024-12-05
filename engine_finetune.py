@@ -179,13 +179,15 @@ def evaluate(data_loader, model, device, task, epoch, mode, num_class):
         batch_size = images.shape[0]
         metric_logger.update(loss=loss.item())
         metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
+
+        
     # gather the stats from all processes
     true_label_decode_list = np.array(true_label_decode_list)
     prediction_decode_list = np.array(prediction_decode_list)
-    confusion_matrix = multilabel_confusion_matrix(true_label_decode_list, prediction_decode_list,labels=[i for i in range(num_class)])
+    confusion_matrix = multilabel_confusion_matrix(true_label_decode_list, prediction_decode_list, labels=[i for i in range(num_class)])
     acc, sensitivity, specificity, precision, G, F1, mcc = misc_measures(confusion_matrix)
     
-    auc_roc = roc_auc_score(true_label_onehot_list, prediction_list,multi_class='ovr',average='macro')
+    auc_roc = roc_auc_score(true_label_onehot_list, prediction_list, multi_class='ovr', average='macro')
     auc_pr = average_precision_score(true_label_onehot_list, prediction_list,average='macro')          
             
     metric_logger.synchronize_between_processes()
@@ -197,12 +199,14 @@ def evaluate(data_loader, model, device, task, epoch, mode, num_class):
         data2=[[acc,sensitivity,specificity,precision,auc_roc,auc_pr,F1,mcc,metric_logger.loss]]
         for i in data2:
             wf.writerow(i)
+        wf.writerow(true_label_onehot_list)
+        wf.writerow(prediction_list)
             
     
     if mode=='test':
         cm = ConfusionMatrix(actual_vector=true_label_decode_list, predict_vector=prediction_decode_list)
-        cm.plot(cmap=plt.cm.Blues,number_label=True,normalized=True,plot_lib="matplotlib")
+        cm.plot(cmap=plt.cm.Blues,number_label=True,normalized=False,plot_lib="matplotlib")
         plt.savefig(task+'confusion_matrix_test.jpg',dpi=600,bbox_inches ='tight')
     
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()},auc_roc
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, auc_roc, sensitivity, specificity, F1
 
