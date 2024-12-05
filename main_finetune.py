@@ -32,12 +32,14 @@ import models_vit
 
 from engine_finetune import train_one_epoch, evaluate
 
+import wandb
+
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE fine-tuning for image classification', add_help=False)
-    parser.add_argument('--batch_size', default=64, type=int,
+    parser.add_argument('--batch_size', default=32, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
-    parser.add_argument('--epochs', default=50, type=int)
+    parser.add_argument('--epochs', default=100, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
@@ -51,31 +53,34 @@ def get_args_parser():
     parser.add_argument('--drop_path', type=float, default=0.1, metavar='PCT',
                         help='Drop path rate (default: 0.1)')
 
+    parser.add_argument('--freeze_backbone', default=False, type=bool, 
+                    help='freeze encoder')
+
     # Optimizer parameters
     parser.add_argument('--clip_grad', type=float, default=None, metavar='NORM',
                         help='Clip gradient norm (default: None, no clipping)')
     parser.add_argument('--weight_decay', type=float, default=0.05,
                         help='weight decay (default: 0.05)')
 
-    parser.add_argument('--lr', type=float, default=None, metavar='LR',
+    parser.add_argument('--lr', type=float, default=None, metavar='LR',    #None
                         help='learning rate (absolute lr)')
-    parser.add_argument('--blr', type=float, default=1e-3, metavar='LR',
+    parser.add_argument('--blr', type=float, default=5e-4, metavar='LR',
                         help='base learning rate: absolute_lr = base_lr * total_batch_size / 256')
     parser.add_argument('--layer_decay', type=float, default=0.75,
                         help='layer-wise lr decay from ELECTRA/BEiT')
 
-    parser.add_argument('--min_lr', type=float, default=1e-6, metavar='LR',
+    parser.add_argument('--min_lr', type=float, default=1e-6, metavar='LR', #1e-7
                         help='lower lr bound for cyclic schedulers that hit 0')
 
-    parser.add_argument('--warmup_epochs', type=int, default=10, metavar='N',
+    parser.add_argument('--warmup_epochs', type=int, default=20, metavar='N',    #10
                         help='epochs to warmup LR')
 
     # Augmentation parameters
-    parser.add_argument('--color_jitter', type=float, default=None, metavar='PCT',
+    parser.add_argument('--color_jitter', type=float, default=None, metavar='PCT',  #None
                         help='Color jitter factor (enabled only when not using Auto/RandAug)')
     parser.add_argument('--aa', type=str, default='rand-m9-mstd0.5-inc1', metavar='NAME',
                         help='Use AutoAugment policy. "v0" or "original". " + "(default: rand-m9-mstd0.5-inc1)'),
-    parser.add_argument('--smoothing', type=float, default=0.1,
+    parser.add_argument('--smoothing', type=float, default=0.1,         #0.1
                         help='Label smoothing (default: 0.1)')
 
     # * Random Erase params
@@ -103,9 +108,11 @@ def get_args_parser():
                         help='How to apply mixup/cutmix params. Per "batch", "pair", or "elem"')
 
     # * Finetuning params
-    parser.add_argument('--finetune', default='',type=str,
+    parser.add_argument('--finetune', default='/home/mkondrac/foundation_model_cardio/code/RETFound_MAE/runs/Retfound_OCT_finetuned/Retfound_oct_finetuned FOLD_0checkpoint-best.pth',type=str,
+                        help='model to load')
+    parser.add_argument('--from_checkpoint', default=True, type=bool,
                         help='finetune from checkpoint')
-    parser.add_argument('--task', default='',type=str,
+    parser.add_argument('--task', default='Retfound_OCT_finetuned FOLD_0',type=str,
                         help='finetune from checkpoint')
     parser.add_argument('--global_pool', action='store_true')
     parser.set_defaults(global_pool=True)
@@ -113,24 +120,24 @@ def get_args_parser():
                         help='Use class token instead of global pool for classification')
 
     # Dataset parameters
-    parser.add_argument('--data_path', default='/home/jupyter/Mor_DR_data/data/data/IDRID/Disease_Grading/', type=str,
+    parser.add_argument('--data_path', default='/home/mkondrac/foundation_model_cardio/code/RETFound_MAE/FAME2_data_augmented/FOLD_0/', type=str,
                         help='dataset path')
-    parser.add_argument('--nb_classes', default=1000, type=int,
+    parser.add_argument('--nb_classes', default=2, type=int,
                         help='number of the classification types')
 
-    parser.add_argument('--output_dir', default='./output_dir',
+    parser.add_argument('--output_dir', default='/home/mkondrac/foundation_model_cardio/code/RETFound_MAE/logs/output_dir_oct',
                         help='path where to save, empty for no saving')
-    parser.add_argument('--log_dir', default='./output_dir',
+    parser.add_argument('--log_dir', default='/home/mkondrac/foundation_model_cardio/code/RETFound_MAE/logs/output_dir_oct',
                         help='path where to tensorboard log')
-    parser.add_argument('--device', default='cuda',
+    parser.add_argument('--device', default='cuda:1',
                         help='device to use for training / testing')
-    parser.add_argument('--seed', default=0, type=int)
-    parser.add_argument('--resume', default='',
+    parser.add_argument('--seed', default=1, type=int)
+    parser.add_argument('--resume', default='/home/mkondrac/foundation_model_cardio/code/RETFound_MAE/runs/Retfound_OCT_finetuned/Retfound_OCT_finetuned FOLD_0checkpoint-best.pth',
                         help='resume from checkpoint')
 
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
-    parser.add_argument('--eval', action='store_true',
+    parser.add_argument('--eval', action='store_true', default=True,
                         help='Perform evaluation only')
     parser.add_argument('--dist_eval', action='store_true', default=False,
                         help='Enabling distributed evaluation (recommended during training for faster monitor')
@@ -147,6 +154,14 @@ def get_args_parser():
     parser.add_argument('--dist_on_itp', action='store_true')
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
+    
+    # logging
+    parser.add_argument('--logging', default="wandb", type=str,
+                        help='choose logging')
+    parser.add_argument('--project_name', default="Retfound", type=str,
+                    help='project name for wandb')
+    
+    
 
     return parser
 
@@ -169,10 +184,10 @@ def main(args):
     dataset_train = build_dataset(is_train='train', args=args)
     dataset_val = build_dataset(is_train='val', args=args)
     dataset_test = build_dataset(is_train='test', args=args)
-
-    if True:  # args.distributed:
-        num_tasks = misc.get_world_size()
-        global_rank = misc.get_rank()
+    
+    num_tasks = misc.get_world_size()
+    global_rank = misc.get_rank()
+    if args.distributed:  #True
         sampler_train = torch.utils.data.DistributedSampler(
             dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
         )
@@ -196,13 +211,24 @@ def main(args):
                 dataset_test, num_replicas=num_tasks, rank=global_rank, shuffle=True)  # shuffle=True to reduce monitor bias
         else:
             sampler_test = torch.utils.data.SequentialSampler(dataset_test)
+    
+    else : 
+        sampler_train = torch.utils.data.RandomSampler(dataset_train)
+        print("Sampler_train = %s" % str(sampler_train))
+
+        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+        sampler_test = torch.utils.data.SequentialSampler(dataset_test)
             
 
+    # Setup logging
+    log_writer = None
     if global_rank == 0 and args.log_dir is not None and not args.eval:
-        os.makedirs(args.log_dir, exist_ok=True)
-        log_writer = SummaryWriter(log_dir=args.log_dir+args.task)
-    else:
-        log_writer = None
+        if args.logging == 'wandb':
+            wandb.init(project=args.project_name, config=args)
+            wandb.run.name = args.task
+        elif args.logging == 'tensorboard':
+            os.makedirs(args.log_dir, exist_ok=True)
+            log_writer = SummaryWriter(log_dir=args.log_dir + args.task)
 
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, sampler=sampler_train,
@@ -238,11 +264,13 @@ def main(args):
             prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
     
+    
     model = models_vit.__dict__[args.model](
         img_size=args.input_size,
         num_classes=args.nb_classes,
         drop_path_rate=args.drop_path,
         global_pool=args.global_pool,
+        freeze_backbone=args.freeze_backbone,
     )
 
     if args.finetune and not args.eval:
@@ -263,9 +291,9 @@ def main(args):
         msg = model.load_state_dict(checkpoint_model, strict=False)
         print(msg)
 
-        if args.global_pool:
+        if args.global_pool and not args.from_checkpoint:
             assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
-        else:
+        elif not args.global_pool:
             assert set(msg.missing_keys) == {'head.weight', 'head.bias'}
 
         # manually initialize fc layer
@@ -315,7 +343,7 @@ def main(args):
     misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
     if args.eval:
-        test_stats,auc_roc = evaluate(data_loader_test, model, device, args.task, epoch=0, mode='test',num_class=args.nb_classes)
+        test_stats, auc_roc, val_sensi, val_spec, val_f1 = evaluate(data_loader_test, model, device, args.task, epoch=0, mode='test',num_class=args.nb_classes)
         exit(0)
 
     print(f"Start training for {args.epochs} epochs")
@@ -332,8 +360,15 @@ def main(args):
             log_writer=log_writer,
             args=args
         )
+        
+        if args.logging == 'wandb':
+            wandb.log({
+                'train/loss': train_stats['loss'],     
+                'lr': train_stats['lr'],  
+                'epoch': epoch
+            })
 
-        val_stats,val_auc_roc = evaluate(data_loader_val, model, device,args.task,epoch, mode='val',num_class=args.nb_classes)
+        val_stats,val_auc_roc, val_sensi, val_spec, val_f1 = evaluate(data_loader_val, model, device,args.task,epoch, mode='val',num_class=args.nb_classes)
         if max_auc<val_auc_roc:
             max_auc = val_auc_roc
             
@@ -342,10 +377,14 @@ def main(args):
                     args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                     loss_scaler=loss_scaler, epoch=epoch)
         
-        if log_writer is not None:
-            log_writer.add_scalar('perf/val_acc1', val_stats['acc1'], epoch)
-            log_writer.add_scalar('perf/val_auc', val_auc_roc, epoch)
-            log_writer.add_scalar('perf/val_loss', val_stats['loss'], epoch)
+        if args.logging == 'wandb':
+            wandb.log({'val/loss' : val_stats['loss'], 'val/auc' : val_auc_roc,'val/sensitivity': val_sensi, 
+                       'val/specificity': val_spec, 'val/F1': val_f1, 'val/accuracy': val_stats['acc1'], 
+                       'epoch': epoch})
+        elif log_writer is not None:
+            log_writer.add_scalar('val/accuracy', val_stats['acc1'], epoch)
+            log_writer.add_scalar('val/auc', val_auc_roc, epoch)
+            log_writer.add_scalar('val/loss', val_stats['loss'], epoch)
             
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                         'epoch': epoch,
@@ -363,7 +402,12 @@ def main(args):
     print('Training time {}'.format(total_time_str))
     state_dict_best = torch.load(args.task+'checkpoint-best.pth', map_location='cpu')
     model_without_ddp.load_state_dict(state_dict_best['model'])
-    test_stats,auc_roc = evaluate(data_loader_test, model_without_ddp, device,args.task,epoch=0, mode='test',num_class=args.nb_classes)
+    test_stats,auc_roc, _, _, _ = evaluate(data_loader_test, model_without_ddp, device,args.task,epoch=0, mode='test',num_class=args.nb_classes)
+    
+    if args.logging == 'wandb':
+        wandb.finish()
+    elif log_writer is not None:
+        log_writer.close()
 
 if __name__ == '__main__':
     args = get_args_parser()
