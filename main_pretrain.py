@@ -32,20 +32,27 @@ from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
 import models_mae
 
+from util.pos_embed import interpolate_pos_embed
+
 from engine_pretrain import train_one_epoch
+
+import wandb
 
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE pre-training', add_help=False)
-    parser.add_argument('--batch_size', default=64, type=int,
+    parser.add_argument('--batch_size', default=32, type=int, #64
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
-    parser.add_argument('--epochs', default=400, type=int)
+    parser.add_argument('--epochs', default=400, type=int) #400
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
     # Model parameters
     parser.add_argument('--model', default='mae_vit_large_patch16', type=str, metavar='MODEL',
                         help='Name of model to train')
+    
+    parser.add_argument('--finetune', default='/data/mkondrac/foundation_model_cardio/code/RETFound_MAE/pretrained/mae_visualize_vit_large.pth',type=str,
+                        help='finetune from pretrained')
 
     parser.add_argument('--input_size', default=224, type=int,
                         help='images input size')
@@ -72,14 +79,14 @@ def get_args_parser():
                         help='epochs to warmup LR')
 
     # Dataset parameters
-    parser.add_argument('--data_path', default='/datasets01/imagenet_full_size/061417/', type=str,
+    parser.add_argument('--data_path', default='/data/mkondrac/foundation_model_cardio/code/RETFound_MAE/PRETRAIN_data_FAME2', type=str,
                         help='dataset path')
 
-    parser.add_argument('--output_dir', default='./output_dir',
+    parser.add_argument('--output_dir', default='/data/mkondrac/foundation_model_cardio/code/RETFound_MAE/output_dir_pretrain_ImNet',
                         help='path where to save, empty for no saving')
-    parser.add_argument('--log_dir', default='./output_dir',
+    parser.add_argument('--log_dir', default='/data/mkondrac/foundation_model_cardio/code/RETFound_MAE/output_dir_pretrain_ImNet',
                         help='path where to tensorboard log')
-    parser.add_argument('--device', default='cuda',
+    parser.add_argument('--device', default='cuda:1',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--resume', default='',
@@ -100,6 +107,16 @@ def get_args_parser():
     parser.add_argument('--dist_on_itp', action='store_true')
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
+    
+    # logging
+    parser.add_argument('--logging', default="wandb", type=str,
+                        help='choose logging')
+    parser.add_argument('--project_name', default="Retfound_pretrain", type=str,
+                    help='project name for wandb')
+    parser.add_argument('--task', default="ViT from ImNet on FAME2", type=str,
+                help='run name wandb')
+    
+    
 
     return parser
 
@@ -127,10 +144,10 @@ def main(args):
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
     dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
     print(dataset_train)
-
-    if True:  # args.distributed:
-        num_tasks = misc.get_world_size()
-        global_rank = misc.get_rank()
+    
+    num_tasks = misc.get_world_size()
+    global_rank = misc.get_rank()
+    if args.distributed:
         sampler_train = torch.utils.data.DistributedSampler(
             dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
         )
@@ -138,11 +155,15 @@ def main(args):
     else:
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
 
-    if global_rank == 0 and args.log_dir is not None:
-        os.makedirs(args.log_dir, exist_ok=True)
-        log_writer = SummaryWriter(log_dir=args.log_dir)
-    else:
-        log_writer = None
+    # Setup logging
+    log_writer = None
+    if global_rank == 0 and args.log_dir:
+        if args.logging == 'wandb':
+            wandb.init(project=args.project_name, config=args)
+            wandb.run.name = args.task
+        elif args.logging == 'tensorboard':
+            os.makedirs(args.log_dir, exist_ok=True)
+            log_writer = SummaryWriter(log_dir=args.log_dir + args.task)
 
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, sampler=sampler_train,
@@ -152,11 +173,30 @@ def main(args):
         drop_last=True,
     )
     
-    # define the model
     model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
-
     model.to(device)
+    
+    if args.finetune:
+        checkpoint = torch.load(args.finetune, map_location='cpu')
+        print(f"Loading pretrained checkpoint from: {args.finetune}")
+        if 'vit_large_patch16_224' in args.finetune:
+            checkpoint_model = checkpoint
+        else : 
+            checkpoint_model = checkpoint['model']
 
+        encoder_keys = [k for k in checkpoint_model.keys() if not k.startswith('decoder')] # remove decoder-related weights
+
+        encoder_checkpoint = {k: checkpoint_model[k] for k in encoder_keys if k in model.state_dict()} # filter the encoder weights
+
+        msg = model.load_state_dict(encoder_checkpoint, strict=False) # load encoder weights into the MAE model
+        print("Loaded encoder weights with message:", msg)
+
+        # Check if any keys are missing or unused
+        # assert set(msg.missing_keys).issubset({'decoder_embed', 'decoder_pos_embed', 'decoder_blocks', 
+        #                                     'decoder_norm', 'decoder_pred', 'mask_token'})
+    
+
+        
     model_without_ddp = model
     print("Model = %s" % str(model_without_ddp))
 
@@ -201,6 +241,13 @@ def main(args):
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                         'epoch': epoch,}
+        
+        if args.logging == 'wandb':
+            wandb.log({
+                'train/loss': train_stats['loss'],     
+                'lr': train_stats['lr'],  
+                'epoch': epoch
+            })
 
         if args.output_dir and misc.is_main_process():
             if log_writer is not None:

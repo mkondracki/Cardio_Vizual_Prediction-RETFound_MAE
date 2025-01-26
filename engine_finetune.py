@@ -3,6 +3,7 @@
 # Partly revised by YZ @UCL&Moorfields
 # --------------------------------------------------------
 
+import json
 import math
 import sys
 import csv
@@ -19,6 +20,7 @@ from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, average_pre
 from pycm import *
 import matplotlib.pyplot as plt
 import numpy as np
+# import cv2
 
 
 
@@ -79,20 +81,28 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     if log_writer is not None:
         print('log_dir: {}'.format(log_writer.log_dir))
 
-    for data_iter_step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for data_iter_step, (data, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
 
         # we use a per iteration (instead of per epoch) lr scheduler
         if data_iter_step % accum_iter == 0:
             lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
-        samples = samples.to(device, non_blocking=True)
+        if args.use_metadata:
+            samples = data[0].to(device, non_blocking=True)
+            metadata = data[1].to(device, non_blocking=True)
+        else : 
+            samples = data.to(device, non_blocking=True)
+
         targets = targets.to(device, non_blocking=True)
 
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
 
         with torch.cuda.amp.autocast():
-            outputs = model(samples)
+            if args.use_metadata:
+                outputs = model(samples, metadata)
+            else : 
+                outputs = model(samples)
             loss = criterion(outputs, targets)
 
         loss_value = loss.item()
@@ -137,14 +147,14 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 @torch.no_grad()
-def evaluate(data_loader, model, device, task, epoch, mode, num_class):
+def evaluate(data_loader, model, device, task, epoch, mode, num_class, use_metadata, output_dir):
     criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = misc.MetricLogger(delimiter="  ")
     header = 'Test:'
     
-    if not os.path.exists(task):
-        os.makedirs(task)
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
 
     prediction_decode_list = []
     prediction_list = []
@@ -155,7 +165,12 @@ def evaluate(data_loader, model, device, task, epoch, mode, num_class):
     model.eval()
 
     for batch in metric_logger.log_every(data_loader, 10, header):
-        images = batch[0]
+        if use_metadata:
+            images = batch[0][0]
+            metadata = batch[0][1].to(device, non_blocking=True)
+        else : 
+            images = batch[0]
+        
         target = batch[-1]
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
@@ -163,7 +178,7 @@ def evaluate(data_loader, model, device, task, epoch, mode, num_class):
 
         # compute output
         with torch.cuda.amp.autocast():
-            output = model(images)
+            output = model(images, metadata) if use_metadata else model(images)
             loss = criterion(output, target)
             prediction_softmax = nn.Softmax(dim=1)(output)
             _,prediction_decode = torch.max(prediction_softmax, 1)
@@ -187,26 +202,114 @@ def evaluate(data_loader, model, device, task, epoch, mode, num_class):
     confusion_matrix = multilabel_confusion_matrix(true_label_decode_list, prediction_decode_list, labels=[i for i in range(num_class)])
     acc, sensitivity, specificity, precision, G, F1, mcc = misc_measures(confusion_matrix)
     
-    auc_roc = roc_auc_score(true_label_onehot_list, prediction_list, multi_class='ovr', average='macro')
+    auc_roc = roc_auc_score(true_label_onehot_list, prediction_list, multi_class='ovo', average='macro')
     auc_pr = average_precision_score(true_label_onehot_list, prediction_list,average='macro')          
             
     metric_logger.synchronize_between_processes()
     
     print('Sklearn Metrics - Acc: {:.4f} AUC-roc: {:.4f} AUC-pr: {:.4f} F1-score: {:.4f} MCC: {:.4f}'.format(acc, auc_roc, auc_pr, F1, mcc)) 
-    results_path = task+'_metrics_{}.csv'.format(mode)
+    results_path = os.path.join(output_dir,task+'_metrics_{}.csv'.format(mode))
     with open(results_path,mode='a',newline='',encoding='utf8') as cfa:
         wf = csv.writer(cfa)
+        data2_name=[["acc","sensitivity","specificity","precision","auc_roc","auc_pr","F1","mcc","loss"]]
         data2=[[acc,sensitivity,specificity,precision,auc_roc,auc_pr,F1,mcc,metric_logger.loss]]
-        for i in data2:
+        for name, i in zip(data2_name, data2):
+            wf.writerow(name)
             wf.writerow(i)
-        wf.writerow(true_label_onehot_list)
-        wf.writerow(prediction_list)
+            
+
+    logits_path = os.path.join(output_dir, task + '_logits_{}.csv'.format(mode))
+    pred_truth = {"truth" : [[int(i[1])] for i in true_label_onehot_list], "predictions" : [[float(i[1])] for i in prediction_list]}
+    with open(logits_path, 'w') as fp:
+        json.dump(pred_truth, fp)
             
     
     if mode=='test':
         cm = ConfusionMatrix(actual_vector=true_label_decode_list, predict_vector=prediction_decode_list)
         cm.plot(cmap=plt.cm.Blues,number_label=True,normalized=False,plot_lib="matplotlib")
-        plt.savefig(task+'confusion_matrix_test.jpg',dpi=600,bbox_inches ='tight')
+        plt.savefig(os.path.join(output_dir, task+'confusion_matrix_test.jpg'),dpi=600,bbox_inches ='tight')
     
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, auc_roc, sensitivity, specificity, F1
+
+
+
+@torch.no_grad()
+def evaluate_classifier(data_loader, model, device, task, epoch, mode, num_class, use_metadata, output_dir):
+    
+    # MODEL MUST BE ON CPU NOT DEVICE
+    
+    assert use_metadata==True
+    
+    # Initialize metrics
+    metric_logger = misc.MetricLogger(delimiter="  ")
+    header = 'Test:'
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    prediction_list = []
+    true_label_decode_list = []
+    true_label_onehot_list = []
+
+    # Switch to evaluation mode
+    model.eval()
+
+    for batch in metric_logger.log_every(data_loader, 10, header):
+        metadata = batch[0]
+        target = batch[-1]
+        true_label = torch.nn.functional.one_hot(target.to(torch.int64), num_classes=num_class)
+
+        # Compute predictions
+        with torch.cuda.amp.autocast():
+            prediction = model(metadata)  # Model handles threshold internally
+
+        prediction_list.extend(prediction.cpu().detach().numpy())
+        true_label_decode_list.extend(target.cpu().detach().numpy())
+        true_label_onehot_list.extend(true_label.cpu().detach().numpy())
+
+    # Convert to NumPy arrays for metric calculations
+    true_label_decode_list = np.array(true_label_decode_list)
+    prediction_list = np.array(prediction_list, dtype=int)
+
+    # Compute confusion matrix
+    confusion_matrix = multilabel_confusion_matrix(
+        true_label_decode_list, prediction_list, labels=[i for i in range(num_class)]
+    )
+
+    # Compute evaluation metrics
+    acc, sensitivity, specificity, precision, G, F1, mcc = misc_measures(confusion_matrix)
+    # auc_roc = roc_auc_score(true_label_onehot_list, prediction_list, multi_class='ovo', average='macro')
+    # auc_pr = average_precision_score(true_label_onehot_list, prediction_list, average='macro')
+    auc_roc = 0.0
+    auc_pr = 0.0
+
+    metric_logger.synchronize_between_processes()
+
+    # Log metrics
+    print('Sklearn Metrics - Acc: {:.4f} AUC-roc: {:.4f} AUC-pr: {:.4f} F1-score: {:.4f} MCC: {:.4f}'.format(
+        acc, auc_roc, auc_pr, F1, mcc))
+
+    # Save results
+    results_path = os.path.join(output_dir, task + '_metrics_{}.csv'.format(mode))
+    with open(results_path, mode='a', newline='', encoding='utf8') as cfa:
+        wf = csv.writer(cfa)
+        data2_name = [["acc", "sensitivity", "specificity", "precision", "auc_roc", "auc_pr", "F1", "mcc"]]
+        data2 = [[acc, sensitivity, specificity, precision, auc_roc, auc_pr, F1, mcc]]
+        for name, i in zip(data2_name, data2):
+            wf.writerow(name)
+            wf.writerow(i)
+
+    logits_path = os.path.join(output_dir, task + '_logits_{}.csv'.format(mode))
+    pred_truth = {"truth" : [[int(i[0])] for i in true_label_onehot_list], "predictions" : [[int(i)] for i in prediction_list]}
+    with open(logits_path, 'w') as fp:
+        json.dump(pred_truth, fp)
+
+    # Generate confusion matrix plot for test mode
+    if mode == 'test':
+        cm = ConfusionMatrix(actual_vector=true_label_decode_list, predict_vector=prediction_list)
+        cm.plot(cmap=plt.cm.Blues, number_label=True, normalized=False, plot_lib="matplotlib")
+        plt.savefig(os.path.join(output_dir, task + '_confusion_matrix_test.jpg'), dpi=600, bbox_inches='tight')
+
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, auc_roc, sensitivity, specificity, F1
+
 

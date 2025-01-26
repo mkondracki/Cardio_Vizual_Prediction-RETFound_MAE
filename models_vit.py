@@ -9,6 +9,8 @@ import torch
 import torch.nn as nn
 
 import timm.models.vision_transformer
+
+from torchvision import models
             
             
 class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
@@ -65,6 +67,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         for name, param in self.named_parameters():
             if "head" not in name and "fc_norm" not in name:
                 param.requires_grad = False
+        print(f"\033[94m\tFoundation model freezed\033[0m")
     
     
     def train(self, mode=True):
@@ -86,10 +89,110 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             # self.fc_norm.train()
 
 
-def vit_large_patch16(freeze_backbone, **kwargs):
-    model = VisionTransformer(
-        patch_size=16, embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4, qkv_bias=True, freeze_backbone=freeze_backbone,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+class FusionVisionTransformer(VisionTransformer):
+    def __init__(self, global_pool=False, freeze_backbone=False, no_visuals=False, metadata_len=None, num_classes=1000, **kwargs):
+        super().__init__(global_pool, freeze_backbone, num_classes, **kwargs)
+        
+        # self.head = nn.Linear(kwargs['embed_dim']*2, num_classes)
+        self.metadata_len = metadata_len
+        self.no_visuals = no_visuals
+        
+        self.fc_projector = nn.Linear(self.metadata_len, kwargs['embed_dim'])
+        size_mult = 2-int(self.no_visuals) 
+        self.head =  nn.Sequential(
+                    nn.Linear(kwargs['embed_dim']*size_mult, 512),  
+                    nn.ReLU(),                        
+                    nn.Linear(512, 128), 
+                    nn.ReLU(),                      
+                    nn.Linear(128, num_classes)  
+                )
+        
+        
+    
+    def forward(self, x, m):
+        """Forward pass through the model."""
+        m = self.fc_projector(m)  
+        if not self.no_visuals:
+            x = self.forward_features(x)
+            return self.head(torch.cat((x, m), 1))
+        
+        return self.head(m)
+
+
+# ResNet Model
+def resnet(use_metadata, freeze_backbone, metadata_len, **kwargs):
+    assert not use_metadata, "ResNet baseline does not use metadata"
+    
+    model = models.resnet50(pretrained=True)
+    
+    # Modify the final fully connected layer to output 2 classes
+    num_features = model.fc.in_features
+    model.fc = nn.Linear(num_features, 2)
+    
+    # Optionally freeze the backbone
+    if freeze_backbone:
+        for param in model.parameters():
+            param.requires_grad = False
+        for param in model.fc.parameters():
+            param.requires_grad = True  # Keep classification head trainable
+    
+    return model
+
+
+class FFRClassifier(nn.Module):
+    def __init__(self, threshold=0.75):
+        super(FFRClassifier, self).__init__()
+        self.threshold = threshold
+        self.max =  1.0
+        self.min =  0.20
+        self.normalized_threshold = (self.threshold - self.min) / (self.max - self.min)
+
+    def forward(self, ffr_value):
+        return (ffr_value <= self.normalized_threshold).float()
+
+
+class DSClassifier(nn.Module):
+    def __init__(self, threshold=50.0):
+        super(DSClassifier, self).__init__()
+        self.threshold = threshold
+        self.max =  98.3
+        self.min =  7.78
+        self.normalized_threshold = (self.threshold - self.min) / (self.max - self.min)
+
+    def forward(self, ds_value):
+        return (ds_value >= self.normalized_threshold).float()
+
+
+def vit_large_patch16(use_metadata, freeze_backbone, no_visuals, metadata_len, **kwargs):
+    if use_metadata:
+        model = FusionVisionTransformer(
+            patch_size=16, embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4, qkv_bias=True, freeze_backbone=freeze_backbone,
+            no_visuals=no_visuals, metadata_len=metadata_len, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    else :
+        model = VisionTransformer(
+            patch_size=16, embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4, qkv_bias=True, freeze_backbone=freeze_backbone,
+            norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+
+
+def resnet(use_metadata, freeze_backbone, metadata_len, **kwargs):
+    model = models.resnet152(pretrained=True)
+    
+    num_features = model.fc.in_features
+    model.fc = nn.Linear(num_features, 2)
+    
+    return model
+
+def ffr_classifier(use_metadata, freeze_backbone, metadata_len, **kwargs):
+    assert use_metadata==True
+    
+    model = FFRClassifier()
+    return model
+
+def ds_classifier(use_metadata, freeze_backbone, metadata_len, **kwargs):
+    assert use_metadata==True
+    
+    model = DSClassifier()
     return model
 
 

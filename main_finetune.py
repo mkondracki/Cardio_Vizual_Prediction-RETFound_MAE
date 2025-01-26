@@ -15,6 +15,8 @@ import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
 
+from torch import nn
+
 import timm
 
 assert timm.__version__ == "0.3.2" # version check
@@ -24,13 +26,13 @@ from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 
 import util.lr_decay as lrd
 import util.misc as misc
-from util.datasets import build_dataset
+from util.datasets import build_dataset, build_metadataset
 from util.pos_embed import interpolate_pos_embed
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
 import models_vit
 
-from engine_finetune import train_one_epoch, evaluate
+from engine_finetune import evaluate_classifier, train_one_epoch, evaluate
 
 import wandb
 
@@ -39,12 +41,12 @@ def get_args_parser():
     parser = argparse.ArgumentParser('MAE fine-tuning for image classification', add_help=False)
     parser.add_argument('--batch_size', default=32, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
-    parser.add_argument('--epochs', default=100, type=int)
+    parser.add_argument('--epochs', default=70, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
     # Model parameters
-    parser.add_argument('--model', default='vit_large_patch16', type=str, metavar='MODEL',
+    parser.add_argument('--model', default='resnet', type=str, metavar='MODEL',
                         help='Name of model to train')
 
     parser.add_argument('--input_size', default=224, type=int,
@@ -52,9 +54,6 @@ def get_args_parser():
 
     parser.add_argument('--drop_path', type=float, default=0.1, metavar='PCT',
                         help='Drop path rate (default: 0.1)')
-
-    parser.add_argument('--freeze_backbone', default=False, type=bool, 
-                    help='freeze encoder')
 
     # Optimizer parameters
     parser.add_argument('--clip_grad', type=float, default=None, metavar='NORM',
@@ -69,16 +68,16 @@ def get_args_parser():
     parser.add_argument('--layer_decay', type=float, default=0.75,
                         help='layer-wise lr decay from ELECTRA/BEiT')
 
-    parser.add_argument('--min_lr', type=float, default=1e-6, metavar='LR', #1e-7
+    parser.add_argument('--min_lr', type=float, default=1e-7, metavar='LR', #1e-7
                         help='lower lr bound for cyclic schedulers that hit 0')
 
-    parser.add_argument('--warmup_epochs', type=int, default=20, metavar='N',    #10
+    parser.add_argument('--warmup_epochs', type=int, default=10, metavar='N',    #10
                         help='epochs to warmup LR')
 
     # Augmentation parameters
     parser.add_argument('--color_jitter', type=float, default=None, metavar='PCT',  #None
                         help='Color jitter factor (enabled only when not using Auto/RandAug)')
-    parser.add_argument('--aa', type=str, default='rand-m9-mstd0.5-inc1', metavar='NAME',
+    parser.add_argument('--aa', type=str, default='rand-m9-mstd0.5-inc10', metavar='NAME', #rand-m9-mstd0.5-inc10
                         help='Use AutoAugment policy. "v0" or "original". " + "(default: rand-m9-mstd0.5-inc1)'),
     parser.add_argument('--smoothing', type=float, default=0.1,         #0.1
                         help='Label smoothing (default: 0.1)')
@@ -108,11 +107,15 @@ def get_args_parser():
                         help='How to apply mixup/cutmix params. Per "batch", "pair", or "elem"')
 
     # * Finetuning params
-    parser.add_argument('--finetune', default='/home/mkondrac/foundation_model_cardio/code/RETFound_MAE/runs/Retfound_OCT_finetuned/Retfound_oct_finetuned FOLD_0checkpoint-best.pth',type=str,
+    parser.add_argument('--finetune', 
+                        default="",
+                        # default="/data/mkondrac/foundation_model_cardio/code/RETFound_MAE/runs/Retfound_FAME2_finetuned/Retfound_fame2_finetuned FOLD_0checkpoint-best.pth",
+                        # default="/data/mkondrac/foundation_model_cardio/code/RETFound_MAE/pretrained/RETFound_fame2_weights.pth",
+                        type=str,
                         help='model to load')
-    parser.add_argument('--from_checkpoint', default=True, type=bool,
+    parser.add_argument('--from_checkpoint', default=False, type=bool,
                         help='finetune from checkpoint')
-    parser.add_argument('--task', default='Retfound_OCT_finetuned FOLD_0',type=str,
+    parser.add_argument('--task', default='Retfound_fame2_finetuned FOLD_0 Fusion',type=str,
                         help='finetune from checkpoint')
     parser.add_argument('--global_pool', action='store_true')
     parser.set_defaults(global_pool=True)
@@ -120,28 +123,42 @@ def get_args_parser():
                         help='Use class token instead of global pool for classification')
 
     # Dataset parameters
-    parser.add_argument('--data_path', default='/home/mkondrac/foundation_model_cardio/code/RETFound_MAE/FAME2_data_augmented/FOLD_0/', type=str,
+    parser.add_argument('--data_path', default='/data/mkondrac/foundation_model_cardio/code/Foundation-Medical/storage/FAME2/FOLD_0', type=str,
                         help='dataset path')
+    
+    parser.add_argument('--use_metadata', default=False, type=bool,
+                        help='metadata')
+
+    parser.add_argument('--no_visuals', default=False, type=bool,
+                        help='if set to true, use only metafeatures to feed MLP for the training/inference')
+    
+    parser.add_argument('--freeze_backbone', default=False, type=bool, 
+                    help='freeze encoder')
+    
     parser.add_argument('--nb_classes', default=2, type=int,
                         help='number of the classification types')
 
-    parser.add_argument('--output_dir', default='/home/mkondrac/foundation_model_cardio/code/RETFound_MAE/logs/output_dir_oct',
+    parser.add_argument('--output_dir', 
+                        default='',
+                        # default='/data/mkondrac/foundation_model_cardio/code/RETFound_MAE/checkpoints/fame2/FOLD_0',
                         help='path where to save, empty for no saving')
-    parser.add_argument('--log_dir', default='/home/mkondrac/foundation_model_cardio/code/RETFound_MAE/logs/output_dir_oct',
+    parser.add_argument('--log_dir', default='/data/mkondrac/foundation_model_cardio/code/RETFound_MAE/logs/output_dir_fame2',
                         help='path where to tensorboard log')
     parser.add_argument('--device', default='cuda:1',
                         help='device to use for training / testing')
-    parser.add_argument('--seed', default=1, type=int)
-    parser.add_argument('--resume', default='/home/mkondrac/foundation_model_cardio/code/RETFound_MAE/runs/Retfound_OCT_finetuned/Retfound_OCT_finetuned FOLD_0checkpoint-best.pth',
+    parser.add_argument('--seed', default=2, type=int)
+    parser.add_argument('--resume', 
+                        default="",
+                        # default="/data/mkondrac/foundation_model_cardio/code/RETFound_MAE/checkpoints/fame2/FOLD_0/Retfound_fame2_finetuned FOLD_0-best-f1.pth",
                         help='resume from checkpoint')
 
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
-    parser.add_argument('--eval', action='store_true', default=True,
+    parser.add_argument('--eval', action='store_true', default=False,
                         help='Perform evaluation only')
     parser.add_argument('--dist_eval', action='store_true', default=False,
                         help='Enabling distributed evaluation (recommended during training for faster monitor')
-    parser.add_argument('--num_workers', default=10, type=int)
+    parser.add_argument('--num_workers', default=0, type=int)
     parser.add_argument('--pin_mem', action='store_true',
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
     parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
@@ -161,7 +178,6 @@ def get_args_parser():
     parser.add_argument('--project_name', default="Retfound", type=str,
                     help='project name for wandb')
     
-    
 
     return parser
 
@@ -180,10 +196,14 @@ def main(args):
     np.random.seed(seed)
 
     cudnn.benchmark = True
-
-    dataset_train = build_dataset(is_train='train', args=args)
-    dataset_val = build_dataset(is_train='val', args=args)
-    dataset_test = build_dataset(is_train='test', args=args)
+    # if args.use_metadata:
+    dataset_train = build_metadataset(is_train='train', args=args)
+    dataset_val = build_metadataset(is_train='val', args=args)
+    dataset_test = build_metadataset(is_train='test', args=args)
+    # else : 
+    #     dataset_train = build_dataset(is_train='train', args=args)
+    #     dataset_val = build_dataset(is_train='val', args=args)
+    #     dataset_test = build_dataset(is_train='test', args=args)
     
     num_tasks = misc.get_world_size()
     global_rank = misc.get_rank()
@@ -216,7 +236,7 @@ def main(args):
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         print("Sampler_train = %s" % str(sampler_train))
 
-        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+        sampler_val = torch.utils.data.RandomSampler(dataset_val)
         sampler_test = torch.utils.data.SequentialSampler(dataset_test)
             
 
@@ -264,14 +284,18 @@ def main(args):
             prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
     
-    
+    metadata_len = dataset_train.metadata_len if args.use_metadata else None
     model = models_vit.__dict__[args.model](
         img_size=args.input_size,
         num_classes=args.nb_classes,
         drop_path_rate=args.drop_path,
         global_pool=args.global_pool,
         freeze_backbone=args.freeze_backbone,
+        use_metadata=args.use_metadata,
+        metadata_len=metadata_len,
+        no_visuals=args.no_visuals
     )
+    
 
     if args.finetune and not args.eval:
         checkpoint = torch.load(args.finetune, map_location='cpu')
@@ -279,25 +303,69 @@ def main(args):
         print("Load pre-trained checkpoint from: %s" % args.finetune)
         checkpoint_model = checkpoint['model']
         state_dict = model.state_dict()
-        for k in ['head.weight', 'head.bias']:
-            if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-                print(f"Removing key {k} from pretrained checkpoint")
-                del checkpoint_model[k]
+        # for k in ['head.weight', 'head.bias']:
+        #     if k in checkpoint_model and k in state_dict and checkpoint_model[k].shape != state_dict[k].shape:
+        #         print(f"Removing key {k} from pretrained checkpoint")
+        #         del checkpoint_model[k]
+        
+        # Remove all keys starting with "head"
+        keys_to_remove = [k for k in checkpoint_model.keys() if k.startswith('head')]
+        for k in keys_to_remove:
+            print(f"Removing key {k} from pretrained checkpoint")
+            del checkpoint_model[k]
 
         # interpolate position embedding
         interpolate_pos_embed(model, checkpoint_model)
+        
+        # Adjust VisionTransformer weights for FusionVisionTransformer
+        adapted_checkpoint = {}
+        for k, v in checkpoint_model.items():
+            if k.startswith('head.'):
+                # Skip the VisionTransformer head since FusionVisionTransformer uses a different one
+                continue
+            adapted_checkpoint[k] = v
+
 
         # load pre-trained model
-        msg = model.load_state_dict(checkpoint_model, strict=False)
+        msg = model.load_state_dict(adapted_checkpoint, strict=False)
         print(msg)
-
+        
+        
         if args.global_pool and not args.from_checkpoint:
-            assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
+            # assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
+            assert set(name.split('.')[0] for name in msg.missing_keys) <= {'fc_projector', 'fc_norm', 'head'}, (
+                "Unexpected missing keys")
         elif not args.global_pool:
             assert set(msg.missing_keys) == {'head.weight', 'head.bias'}
+        
+        
+        
+        ###########################        
 
-        # manually initialize fc layer
-        trunc_normal_(model.head.weight, std=2e-5)
+        # Ensure additional keys (like fc_projector) are correctly initialized
+        if hasattr(model, 'fc_projector'):
+            trunc_normal_(model.fc_projector.weight, std=2e-5)
+            if model.fc_projector.bias is not None:
+                model.fc_projector.bias.data.zero_()
+
+        # Manually initialize the FusionVisionTransformer head
+        if hasattr(model, 'head'):
+            if isinstance(model.head, nn.Sequential):
+                for layer in model.head:
+                    if isinstance(layer, nn.Linear):
+                        trunc_normal_(layer.weight, std=2e-5)
+                        if layer.bias is not None:
+                            layer.bias.data.zero_()
+            else:
+                trunc_normal_(model.head.weight, std=2e-5)
+                        
+    if "Classifier" in model._get_name():
+        test_stats, auc_roc, val_sensi, val_spec, val_f1 = evaluate_classifier(data_loader_test, model, device, args.resume, 
+                                                                    epoch=0, mode='test',num_class=args.nb_classes, 
+                                                                    use_metadata=args.use_metadata, output_dir=args.output_dir)
+        
+        exit(0)
+
 
     model.to(device)
 
@@ -321,13 +389,22 @@ def main(args):
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
-
+        
     # build optimizer with layer-wise lr decay (lrd)
-    param_groups = lrd.param_groups_lrd(model_without_ddp, args.weight_decay,
-        no_weight_decay_list=model_without_ddp.no_weight_decay(),
-        layer_decay=args.layer_decay
-    )
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
+    if "ResNet" not in model._get_name():
+        param_groups = lrd.param_groups_lrd(model_without_ddp, args.weight_decay,
+            no_weight_decay_list=model_without_ddp.no_weight_decay(),
+            layer_decay=args.layer_decay
+        )
+        optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
+    else:
+        optimizer = torch.optim.SGD(
+            model_without_ddp.parameters(),
+            lr=args.lr,
+            momentum=0.9,
+            weight_decay=args.weight_decay
+        )
+        print(f"USING SGD OPTIMIZER WITH LR: {args.lr}")
     loss_scaler = NativeScaler()
 
     if mixup_fn is not None:
@@ -343,13 +420,16 @@ def main(args):
     misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
     if args.eval:
-        test_stats, auc_roc, val_sensi, val_spec, val_f1 = evaluate(data_loader_test, model, device, args.task, epoch=0, mode='test',num_class=args.nb_classes)
+        test_stats, auc_roc, val_sensi, val_spec, val_f1 = evaluate(data_loader_test, model, device, args.resume, 
+                                                                    epoch=0, mode='test',num_class=args.nb_classes, 
+                                                                    use_metadata=args.use_metadata, output_dir=args.output_dir)
         exit(0)
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     max_accuracy = 0.0
     max_auc = 0.0
+    max_f1 = 0.0
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
@@ -368,14 +448,22 @@ def main(args):
                 'epoch': epoch
             })
 
-        val_stats,val_auc_roc, val_sensi, val_spec, val_f1 = evaluate(data_loader_val, model, device,args.task,epoch, mode='val',num_class=args.nb_classes)
+        val_stats,val_auc_roc, val_sensi, val_spec, val_f1 = evaluate(data_loader_val, model, device,args.task,epoch, mode='val',
+                                                                      num_class=args.nb_classes, use_metadata=args.use_metadata, output_dir=args.output_dir)
         if max_auc<val_auc_roc:
             max_auc = val_auc_roc
-            
             if args.output_dir:
                 misc.save_model(
                     args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                    loss_scaler=loss_scaler, epoch=epoch)
+                    loss_scaler=loss_scaler, epoch=epoch, ckpt_name='-best-auc.pth')
+                
+        if max_f1<val_f1:
+            max_f1 = val_f1
+            if args.output_dir:
+                misc.save_model(
+                    args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+                    loss_scaler=loss_scaler, epoch=epoch, ckpt_name='-best-f1.pth')
+                
         
         if args.logging == 'wandb':
             wandb.log({'val/loss' : val_stats['loss'], 'val/auc' : val_auc_roc,'val/sensitivity': val_sensi, 
@@ -402,7 +490,7 @@ def main(args):
     print('Training time {}'.format(total_time_str))
     state_dict_best = torch.load(args.task+'checkpoint-best.pth', map_location='cpu')
     model_without_ddp.load_state_dict(state_dict_best['model'])
-    test_stats,auc_roc, _, _, _ = evaluate(data_loader_test, model_without_ddp, device,args.task,epoch=0, mode='test',num_class=args.nb_classes)
+    test_stats,auc_roc, _, _, _ = evaluate(data_loader_test, model_without_ddp, device,args.resume,epoch=0, mode='test',num_class=args.nb_classes, output_dir=args.output_dir)
     
     if args.logging == 'wandb':
         wandb.finish()
