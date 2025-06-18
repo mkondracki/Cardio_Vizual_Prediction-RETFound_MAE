@@ -20,44 +20,96 @@ from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, average_pre
 from pycm import *
 import matplotlib.pyplot as plt
 import numpy as np
-# import cv2
+from loss import FocalLoss
+import cv2
 
 
 
+# Function to save a batch of images as a grid
+def save_batch_as_grid(batch, output_file):
+    # Ensure the batch is on the CPU and convert to NumPy
+    batch = batch.cpu().numpy()  # Convert from tensor to NumPy array
+    batch = np.transpose(batch, (0, 2, 3, 1))  # Convert from (N, C, H, W) to (N, H, W, C)
+    batch = (batch * 255).astype(np.uint8)  # Scale to [0, 255] and convert to uint8 if needed
 
-def misc_measures(confusion_matrix):
-    
+    # Calculate grid size (e.g., 4x8 for 32 images)
+    grid_rows = int(np.ceil(np.sqrt(batch.shape[0])))
+    grid_cols = int(np.ceil(batch.shape[0] / grid_rows))
+
+    # Create a blank canvas for the grid
+    img_height, img_width = batch.shape[1], batch.shape[2]
+    grid_image = np.zeros((grid_rows * img_height, grid_cols * img_width, 3), dtype=np.uint8)
+
+    # Place each image in the grid
+    for idx, img in enumerate(batch):
+        row = idx // grid_cols
+        col = idx % grid_cols
+        grid_image[row * img_height:(row + 1) * img_height, col * img_width:(col + 1) * img_width, :] = img
+
+    # Save the grid image as a PNG file
+    cv2.imwrite(output_file, cv2.cvtColor(grid_image, cv2.COLOR_RGB2BGR))
+    print(f"Batch saved as grid image at: {output_file}")
+
+
+
+def misc_measure(confusion_matrix, y_true, y_pred_proba):
     acc = []
     sensitivity = []
     specificity = []
     precision = []
     G = []
-    F1_score_2 = []
-    mcc_ = []
-    
+    F1_score = []
+    confusion_matrices = []
+    roc_auc = None
+
     for i in range(1, confusion_matrix.shape[0]):
-        cm1=confusion_matrix[i]
-        acc.append(1.*(cm1[0,0]+cm1[1,1])/np.sum(cm1))
-        sensitivity_ = 1.*cm1[1,1]/(cm1[1,0]+cm1[1,1])
+        cm1 = confusion_matrix[i]
+        confusion_matrices.append(cm1)  # Store the confusion matrix
+
+        total = np.sum(cm1)
+        tp = cm1[1, 1]
+        tn = cm1[0, 0]
+        fp = cm1[0, 1]
+        fn = cm1[1, 0]
+
+        # Accuracy
+        acc.append((tp + tn) / total if total != 0 else 0)
+
+        # Sensitivity
+        sensitivity_ = tp / (tp + fn) if (tp + fn) != 0 else 0
         sensitivity.append(sensitivity_)
-        specificity_ = 1.*cm1[0,0]/(cm1[0,1]+cm1[0,0])
+
+        # Specificity
+        specificity_ = tn / (tn + fp) if (tn + fp) != 0 else 0
         specificity.append(specificity_)
-        precision_ = 1.*cm1[1,1]/(cm1[1,1]+cm1[0,1])
+
+        # Precision
+        precision_ = tp / (tp + fp) if (tp + fp) != 0 else 0
         precision.append(precision_)
-        G.append(np.sqrt(sensitivity_*specificity_))
-        F1_score_2.append(2*precision_*sensitivity_/(precision_+sensitivity_))
-        mcc = (cm1[0,0]*cm1[1,1]-cm1[0,1]*cm1[1,0])/np.sqrt((cm1[0,0]+cm1[0,1])*(cm1[0,0]+cm1[1,0])*(cm1[1,1]+cm1[1,0])*(cm1[1,1]+cm1[0,1]))
-        mcc_.append(mcc)
-        
-    acc = np.array(acc).mean()
-    sensitivity = np.array(sensitivity).mean()
-    specificity = np.array(specificity).mean()
-    precision = np.array(precision).mean()
-    G = np.array(G).mean()
-    F1_score_2 = np.array(F1_score_2).mean()
-    mcc_ = np.array(mcc_).mean()
-    
-    return acc, sensitivity, specificity, precision, G, F1_score_2, mcc_
+
+        # Geometric Mean (G)
+        G.append(np.sqrt(sensitivity_ * specificity_))
+
+        # F1 Score
+        F1_score.append(2 * precision_ * sensitivity_ / (precision_ + sensitivity_) if (precision_ + sensitivity_) != 0 else 0)
+
+    # Calculate ROC AUC
+    if y_true is not None and y_pred_proba is not None:
+        try:
+            roc_auc = roc_auc_score(y_true, y_pred_proba)
+        except ValueError:
+            roc_auc = None  # Handle cases where ROC AUC cannot be computed
+
+    return {
+        "accuracy": acc,
+        "sensitivity": sensitivity,
+        "specificity": specificity,
+        "precision": precision,
+        "geometric_mean": G,
+        "f1_score": F1_score,
+        "confusion_matrices": confusion_matrices,
+        "roc_auc": roc_auc
+    }
 
 
 
@@ -142,13 +194,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-
-
-
+    
 
 @torch.no_grad()
-def evaluate(data_loader, model, device, task, epoch, mode, num_class, use_metadata, output_dir):
-    criterion = torch.nn.CrossEntropyLoss()
+def evaluate(data_loader, model, device, task, epoch, mode, criterion, num_class, use_metadata, output_dir):
+    # criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = misc.MetricLogger(delimiter="  ")
     header = 'Test:'
@@ -177,17 +227,17 @@ def evaluate(data_loader, model, device, task, epoch, mode, num_class, use_metad
         true_label=F.one_hot(target.to(torch.int64), num_classes=num_class)
 
         # compute output
-        with torch.cuda.amp.autocast():
-            output = model(images, metadata) if use_metadata else model(images)
-            loss = criterion(output, target)
-            prediction_softmax = nn.Softmax(dim=1)(output)
-            _,prediction_decode = torch.max(prediction_softmax, 1)
-            _,true_label_decode = torch.max(true_label, 1)
+        # with torch.cuda.amp.autocast():
+        output = model(images, metadata) if use_metadata else model(images)
+        loss = criterion(output, target)
+        prediction_softmax = nn.Softmax(dim=1)(output)
+        _,prediction_decode = torch.max(prediction_softmax, 1)
+        _,true_label_decode = torch.max(true_label, 1)
 
-            prediction_decode_list.extend(prediction_decode.cpu().detach().numpy())
-            true_label_decode_list.extend(true_label_decode.cpu().detach().numpy())
-            true_label_onehot_list.extend(true_label.cpu().detach().numpy())
-            prediction_list.extend(prediction_softmax.cpu().detach().numpy())
+        prediction_decode_list.extend(prediction_decode.cpu().detach().numpy())
+        true_label_decode_list.extend(true_label_decode.cpu().detach().numpy())
+        true_label_onehot_list.extend(true_label.cpu().detach().numpy())
+        prediction_list.extend(prediction_softmax.cpu().detach().numpy())
 
         acc1,_ = accuracy(output, target, topk=(1,2))
 
@@ -200,19 +250,41 @@ def evaluate(data_loader, model, device, task, epoch, mode, num_class, use_metad
     true_label_decode_list = np.array(true_label_decode_list)
     prediction_decode_list = np.array(prediction_decode_list)
     confusion_matrix = multilabel_confusion_matrix(true_label_decode_list, prediction_decode_list, labels=[i for i in range(num_class)])
-    acc, sensitivity, specificity, precision, G, F1, mcc = misc_measures(confusion_matrix)
+    # acc, sensitivity, specificity, precision, G, F1, mcc = misc_measures(confusion_matrix)
     
-    auc_roc = roc_auc_score(true_label_onehot_list, prediction_list, multi_class='ovo', average='macro')
-    auc_pr = average_precision_score(true_label_onehot_list, prediction_list,average='macro')          
+    # auc_roc = roc_auc_score(true_label_onehot_list, prediction_list, multi_class='ovo', average='macro')
+    # auc_pr = average_precision_score(true_label_onehot_list, prediction_list, average='macro')          
             
     metric_logger.synchronize_between_processes()
-    
-    print('Sklearn Metrics - Acc: {:.4f} AUC-roc: {:.4f} AUC-pr: {:.4f} F1-score: {:.4f} MCC: {:.4f}'.format(acc, auc_roc, auc_pr, F1, mcc)) 
-    results_path = os.path.join(output_dir,task+'_metrics_{}.csv'.format(mode))
-    with open(results_path,mode='a',newline='',encoding='utf8') as cfa:
+
+    # Extract metrics from the results of misc_measure
+    results = misc_measure(confusion_matrix, true_label_onehot_list, prediction_list)
+    acc = results["accuracy"]
+    sensitivity = results["sensitivity"]
+    specificity = results["specificity"]
+    precision = results["precision"]
+    auc_roc = results["roc_auc"]
+    F1 = results["f1_score"]
+    geometric_mean = results["geometric_mean"]
+
+    print('Metrics - Acc: {:.4f} AUC-roc: {:.4f} F1-score: {:.4f}'.format(
+        np.mean(acc), auc_roc, np.mean(F1)
+    )) 
+
+    results_path = os.path.join(output_dir, task + '_metrics_{}.csv'.format(mode))
+    with open(results_path, mode='a', newline='', encoding='utf8') as cfa:
         wf = csv.writer(cfa)
-        data2_name=[["acc","sensitivity","specificity","precision","auc_roc","auc_pr","F1","mcc","loss"]]
-        data2=[[acc,sensitivity,specificity,precision,auc_roc,auc_pr,F1,mcc,metric_logger.loss]]
+        data2_name = [["acc", "sensitivity", "specificity", "precision", "auc_roc", "F1", "geometric_mean", "loss"]]
+        data2 = [[
+            np.mean(acc), 
+            np.mean(sensitivity), 
+            np.mean(specificity), 
+            np.mean(precision), 
+            auc_roc, 
+            np.mean(F1), 
+            np.mean(geometric_mean), 
+            metric_logger.loss
+        ]]
         for name, i in zip(data2_name, data2):
             wf.writerow(name)
             wf.writerow(i)
@@ -277,7 +349,14 @@ def evaluate_classifier(data_loader, model, device, task, epoch, mode, num_class
     )
 
     # Compute evaluation metrics
-    acc, sensitivity, specificity, precision, G, F1, mcc = misc_measures(confusion_matrix)
+    results = misc_measure(confusion_matrix)
+    acc = results["accuracy"]
+    sensitivity = results["sensitivity"]
+    specificity = results["specificity"]
+    precision = results["precision"]
+    auc_roc = results["roc_auc"]
+    F1 = results["f1_score"]
+    geometric_mean = results["geometric_mean"]
     # auc_roc = roc_auc_score(true_label_onehot_list, prediction_list, multi_class='ovo', average='macro')
     # auc_pr = average_precision_score(true_label_onehot_list, prediction_list, average='macro')
     auc_roc = 0.0
@@ -286,15 +365,25 @@ def evaluate_classifier(data_loader, model, device, task, epoch, mode, num_class
     metric_logger.synchronize_between_processes()
 
     # Log metrics
-    print('Sklearn Metrics - Acc: {:.4f} AUC-roc: {:.4f} AUC-pr: {:.4f} F1-score: {:.4f} MCC: {:.4f}'.format(
-        acc, auc_roc, auc_pr, F1, mcc))
+    print('Metrics - Acc: {:.4f} AUC-roc: {:.4f} F1-score: {:.4f}'.format(
+        np.mean(acc), auc_roc, np.mean(F1)
+    ))
 
     # Save results
     results_path = os.path.join(output_dir, task + '_metrics_{}.csv'.format(mode))
     with open(results_path, mode='a', newline='', encoding='utf8') as cfa:
         wf = csv.writer(cfa)
-        data2_name = [["acc", "sensitivity", "specificity", "precision", "auc_roc", "auc_pr", "F1", "mcc"]]
-        data2 = [[acc, sensitivity, specificity, precision, auc_roc, auc_pr, F1, mcc]]
+        data2_name = [["acc", "sensitivity", "specificity", "precision", "auc_roc", "F1", "geometric_mean", "loss"]]
+        data2 = [[
+            np.mean(acc),
+            np.mean(sensitivity),
+            np.mean(specificity),
+            np.mean(precision),
+            auc_roc,
+            np.mean(F1),
+            np.mean(geometric_mean),
+            metric_logger.loss
+        ]]
         for name, i in zip(data2_name, data2):
             wf.writerow(name)
             wf.writerow(i)

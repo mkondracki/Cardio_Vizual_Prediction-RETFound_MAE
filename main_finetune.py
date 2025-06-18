@@ -4,6 +4,7 @@
 # --------------------------------------------------------
 
 import argparse
+from collections import Counter
 import datetime
 import json
 import numpy as np
@@ -30,11 +31,15 @@ from util.datasets import build_dataset, build_metadataset
 from util.pos_embed import interpolate_pos_embed
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
+import util.lr_sched as lr_sched
+
 import models_vit
 
 from engine_finetune import evaluate_classifier, train_one_epoch, evaluate
 
 import wandb
+
+from loss import FocalLoss
 
 
 def get_args_parser():
@@ -123,7 +128,7 @@ def get_args_parser():
                         help='Use class token instead of global pool for classification')
 
     # Dataset parameters
-    parser.add_argument('--data_path', default='/data/mkondrac/foundation_model_cardio/code/Foundation-Medical/storage/FAME2/FOLD_0', type=str,
+    parser.add_argument('--data_path', default='/data/mkondrac/foundation_model_cardio/data/FAME2_Database_SAM2/Classification/FOLD0', type=str,
                         help='dataset path')
     
     parser.add_argument('--use_metadata', default=False, type=bool,
@@ -178,6 +183,26 @@ def get_args_parser():
     parser.add_argument('--project_name', default="Retfound", type=str,
                     help='project name for wandb')
     
+    # criterion
+    parser.add_argument('--criterion', default='None', type=str,
+                        help='criterion for training')
+    
+    # balance train
+    parser.add_argument('--train_balance', default=False, type=bool,
+                        help='balance train')
+    
+    
+    # adaptive lr
+    parser.add_argument('--adaptive_lr', action='store_true', default=True,
+                        help='Enable adaptive learning rate')
+    parser.add_argument('--adaptive_lr_patience', type=int, default=5,
+                        help='Number of epochs to wait before reducing learning rate')
+    parser.add_argument('--adaptive_lr_factor', type=float, default=0.1,
+                        help='Factor by which to reduce learning rate')
+    parser.add_argument('--adaptive_lr_metric', type=str, default='auc',
+                        choices=['auc', 'f1', 'acc'], 
+                        help='Metric to monitor for adaptive learning rate')
+    
 
     return parser
 
@@ -196,14 +221,14 @@ def main(args):
     np.random.seed(seed)
 
     cudnn.benchmark = True
-    # if args.use_metadata:
-    dataset_train = build_metadataset(is_train='train', args=args)
-    dataset_val = build_metadataset(is_train='val', args=args)
-    dataset_test = build_metadataset(is_train='test', args=args)
-    # else : 
-    #     dataset_train = build_dataset(is_train='train', args=args)
-    #     dataset_val = build_dataset(is_train='val', args=args)
-    #     dataset_test = build_dataset(is_train='test', args=args)
+    if args.use_metadata:
+        dataset_train = build_metadataset(is_train='train', args=args)
+        dataset_val = build_metadataset(is_train='val', args=args)
+        dataset_test = build_metadataset(is_train='val', args=args)
+    else : 
+        dataset_train = build_dataset(is_train='train', args=args)
+        dataset_val = build_dataset(is_train='val', args=args)
+        dataset_test = build_dataset(is_train='val', args=args)
     
     num_tasks = misc.get_world_size()
     global_rank = misc.get_rank()
@@ -231,6 +256,24 @@ def main(args):
                 dataset_test, num_replicas=num_tasks, rank=global_rank, shuffle=True)  # shuffle=True to reduce monitor bias
         else:
             sampler_test = torch.utils.data.SequentialSampler(dataset_test)
+            
+    elif args.train_balance:
+        # Balance the loading 
+        labels = [sample[1] for sample in dataset_train]  # Assuming dataset_train returns (data, label)
+        label_counts = Counter(labels)
+        total_samples = len(labels)
+        class_weights = {label: total_samples / count for label, count in label_counts.items()}
+        weights = [class_weights[label] for label in labels]
+        sampler_train = torch.utils.data.WeightedRandomSampler(
+            weights=weights,
+            num_samples=len(weights),
+            replacement=True
+        )
+        print("Sampler_train = %s" % str(sampler_train))
+        
+        sampler_val = torch.utils.data.RandomSampler(dataset_val)
+        sampler_test = torch.utils.data.SequentialSampler(dataset_test)
+        
     
     else : 
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
@@ -250,6 +293,7 @@ def main(args):
             os.makedirs(args.log_dir, exist_ok=True)
             log_writer = SummaryWriter(log_dir=args.log_dir + args.task)
 
+    # Update the DataLoader for training
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, sampler=sampler_train,
         batch_size=args.batch_size,
@@ -302,7 +346,7 @@ def main(args):
 
         print("Load pre-trained checkpoint from: %s" % args.finetune)
         checkpoint_model = checkpoint['model']
-        state_dict = model.state_dict()
+        # state_dict = model.state_dict()
         # for k in ['head.weight', 'head.bias']:
         #     if k in checkpoint_model and k in state_dict and checkpoint_model[k].shape != state_dict[k].shape:
         #         print(f"Removing key {k} from pretrained checkpoint")
@@ -361,7 +405,7 @@ def main(args):
                         
     if "Classifier" in model._get_name():
         test_stats, auc_roc, val_sensi, val_spec, val_f1 = evaluate_classifier(data_loader_test, model, device, args.resume, 
-                                                                    epoch=0, mode='test',num_class=args.nb_classes, 
+                                                                    epoch=0, mode='test',criterion=criterion, num_class=args.nb_classes, 
                                                                     use_metadata=args.use_metadata, output_dir=args.output_dir)
         
         exit(0)
@@ -373,12 +417,17 @@ def main(args):
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     print("Model = %s" % str(model_without_ddp))
-    print('number of params (M): %.2f' % (n_parameters / 1.e6))
+    print(f'number of trainable params (M): {n_parameters:.2f}')
 
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
     
     if args.lr is None:  # only base_lr is specified
         args.lr = args.blr * eff_batch_size / 256
+        
+    # for lr scheduling
+    best_metric = 0.0
+    patience_counter = 0
+    lr_scaling_applied = 1.0
 
     print("base lr: %.2e" % (args.lr * 256 / eff_batch_size))
     print("actual lr: %.2e" % args.lr)
@@ -407,7 +456,17 @@ def main(args):
         print(f"USING SGD OPTIMIZER WITH LR: {args.lr}")
     loss_scaler = NativeScaler()
 
-    if mixup_fn is not None:
+    if args.criterion == 'focal':
+        criterion = FocalLoss()
+    elif args.criterion == 'bce':
+        base_criterion = torch.nn.BCEWithLogitsLoss()
+        # Wrap the model's output to handle single-dimensional targets
+        def criterion_wrapper(output, target):
+            if output.dim() == 2 and output.size(1) == 2:
+                output = output[:, 1]  # Use the second column for binary classification
+            return base_criterion(output, target.float())
+        criterion = criterion_wrapper
+    elif mixup_fn is not None:
         # smoothing is handled with mixup label transform
         criterion = SoftTargetCrossEntropy()
     elif args.smoothing > 0.:
@@ -421,7 +480,7 @@ def main(args):
 
     if args.eval:
         test_stats, auc_roc, val_sensi, val_spec, val_f1 = evaluate(data_loader_test, model, device, args.resume, 
-                                                                    epoch=0, mode='test',num_class=args.nb_classes, 
+                                                                    epoch=0, mode='test', criterion=criterion, num_class=args.nb_classes, 
                                                                     use_metadata=args.use_metadata, output_dir=args.output_dir)
         exit(0)
 
@@ -448,8 +507,41 @@ def main(args):
                 'epoch': epoch
             })
 
-        val_stats,val_auc_roc, val_sensi, val_spec, val_f1 = evaluate(data_loader_val, model, device,args.task,epoch, mode='val',
-                                                                      num_class=args.nb_classes, use_metadata=args.use_metadata, output_dir=args.output_dir)
+        val_stats, val_auc_roc, val_sensi, val_spec, val_f1_ = evaluate(data_loader_val, model, 
+                                                                      device,args.task,epoch, 
+                                                                      mode='val',
+                                                                      criterion=criterion, 
+                                                                      num_class=args.nb_classes, 
+                                                                      use_metadata=args.use_metadata, 
+                                                                      output_dir=args.output_dir)
+        
+        # Add in the training loop after validation
+        if args.adaptive_lr:
+            # Choose metric to monitor based on user preference
+            if args.adaptive_lr_metric == 'auc':
+                current_metric = val_auc_roc
+            elif args.adaptive_lr_metric == 'f1':
+                current_metric = val_f1
+            else:  # 'acc'
+                current_metric = val_stats['acc1']
+            
+            # Check if metric improved
+            if current_metric > best_metric:
+                best_metric = current_metric
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                
+            # Reduce learning rate if no improvement for patience epochs
+            if patience_counter >= args.adaptive_lr_patience:
+                new_lr = lr_sched.apply_adaptive_lr_scaling(optimizer, args.adaptive_lr_factor)
+                lr_scaling_applied *= args.adaptive_lr_factor
+                patience_counter = 0
+                print(f"Learning rate reduced to {new_lr:.6f} (scaling: {lr_scaling_applied:.6f})")
+                if args.logging == 'wandb':
+                    wandb.log({'lr_reduced': new_lr, 'epoch': epoch})
+        
+        val_f1 = val_f1_[0]
         if max_auc<val_auc_roc:
             max_auc = val_auc_roc
             if args.output_dir:
@@ -490,7 +582,14 @@ def main(args):
     print('Training time {}'.format(total_time_str))
     state_dict_best = torch.load(args.task+'checkpoint-best.pth', map_location='cpu')
     model_without_ddp.load_state_dict(state_dict_best['model'])
-    test_stats,auc_roc, _, _, _ = evaluate(data_loader_test, model_without_ddp, device,args.resume,epoch=0, mode='test',num_class=args.nb_classes, output_dir=args.output_dir)
+    test_stats,auc_roc, _, _, _ = evaluate(data_loader_test, 
+                                           model_without_ddp, 
+                                           device,args.resume,
+                                           epoch=0, 
+                                           mode='test',
+                                           criterion=criterion,
+                                           num_class=args.nb_classes, 
+                                           output_dir=args.output_dir)
     
     if args.logging == 'wandb':
         wandb.finish()

@@ -17,6 +17,8 @@ import torch
 import util.misc as misc
 import util.lr_sched as lr_sched
 
+import cv2
+import numpy as np
 
 def train_one_epoch(model: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -43,7 +45,26 @@ def train_one_epoch(model: torch.nn.Module,
             lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
         samples = samples.to(device, non_blocking=True)
-
+        
+        # Save a sample image for visualization
+        if data_iter_step == 0:  # Save only the first batch of the epoch
+            batch_images = samples.cpu().numpy().transpose(0, 2, 3, 1)  # Convert to NHWC format
+            batch_images = (batch_images - batch_images.min()) / (batch_images.max() - batch_images.min())  # Normalize to [0, 1]
+            batch_images = (batch_images * 255).astype('uint8')  # Scale to [0, 255] and convert to uint8
+            
+            # Create a grid of 32 images (assuming 4x8 grid)
+            grid_rows, grid_cols = 4, 8
+            img_height, img_width = batch_images.shape[1], batch_images.shape[2]
+            grid_image = np.zeros((grid_rows * img_height, grid_cols * img_width, 3), dtype='uint8')
+            
+            for idx, img in enumerate(batch_images[:grid_rows * grid_cols]):
+                row = idx // grid_cols
+                col = idx % grid_cols
+                grid_image[row * img_height:(row + 1) * img_height, col * img_width:(col + 1) * img_width, :] = img
+                
+                save_path = '/data/mkondrac/foundation_model_cardio/code/RETFound_MAE/visualize_data_augmnetation_pretrain/sample_grid.png'
+                cv2.imwrite(save_path, cv2.cvtColor(grid_image, cv2.COLOR_RGB2BGR))
+        
         with torch.cuda.amp.autocast():
             loss, _, _ = model(samples, mask_ratio=args.mask_ratio)
 
