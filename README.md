@@ -1,27 +1,19 @@
-## RETFound - A foundation model for retinal imaging
+## Fork from "RETFound - A foundation model for retinal imaging"
 
 
-Official repo for [RETFound: a foundation model for generalizable disease detection from retinal images](https://www.nature.com/articles/s41586-023-06555-x), which is based on [MAE](https://github.com/facebookresearch/mae):
+Adaptation of the RETFound pretrain/finetune pipelines for FAME2 dataset. 
 
-Please contact 	**ykzhoua@gmail.com** or **yukun.zhou.19@ucl.ac.uk** if you have questions.
+The goal of the project is to evaluate perfomances of pretrained Vision Transformers on classification of cardiac event prediction. 
 
-Keras version implemented by Yuka Kihara can be found [here](https://github.com/uw-biomedical-ml/RETFound_MAE)
+
+<img src=images/Pretrain_scheme.png alt="Example Image" width="500">
 
 
 ### 📝Key features
 
-- RETFound is pre-trained on 1.6 million retinal images with self-supervised learning
-- RETFound has been validated in multiple disease detection tasks
-- RETFound can be efficiently adapted to customised tasks
+- Different models (ViT on ImNet, ResNet) in models_vit.py 
+- RETFound-FAME2 has been validated on 3-FOLD dataset consisting of XCA images with binary label (cardiac envent within 2 years or not)
 
-
-### 🎉News
-
-- 🐉2024/01: [Feature vector notebook](https://github.com/rmaphoh/RETFound_MAE/blob/main/RETFound_Feature.ipynb) are now online!
-- 🐉2024/01: [Data split and model checkpoints](BENCHMARK.md) for public datasets are now online!
-- 🎄2023/12: [Colab notebook](https://colab.research.google.com/drive/1_X19zdMegmAlqPAEY0Ao659fzzzlx2IZ?usp=sharing) is now online - free GPU & simple operation!
-- 2023/09: a [visualisation demo](https://github.com/rmaphoh/RETFound_MAE/blob/main/RETFound_visualize.ipynb) is added
-- 2023/10: change the hyperparameter of [input_size](https://github.com/rmaphoh/RETFound_MAE#:~:text=finetune%20./RETFound_cfp_weights.pth%20%5C-,%2D%2Dinput_size%20224,-For%20evaluation%20only) for any image size
 
 
 ### 🔧Install environment
@@ -53,69 +45,67 @@ To fine tune RETFound on your own data, follow these steps:
 <th valign="bottom"></th>
 <th valign="bottom">ViT-Large</th>
 <!-- TABLE BODY -->
-<tr><td align="left">Colour fundus image</td>
-<td align="center"><a href="https://drive.google.com/file/d/1l62zbWUFTlp214SvK6eMwPQZAzcwoeBE/view?usp=sharing">download</a></td>
+<tr><td align="left">RETFound_cfp-XCA-FAME2 pretraining</td>
+<td align="center"><a href="https://drive.google.com/file/d/1cUucmFR_24gg0rmtKyVClHGsGRKcqFqD/view?usp=sharing">download</a></td>
 </tr>
 <!-- TABLE BODY -->
-<tr><td align="left">OCT</td>
-<td align="center"><a href="https://drive.google.com/file/d/1m6s7QYkjyjJDlpEuXm7Xp3PmjN-elfW2/view?usp=sharing">download</a></td>
+<tr><td align="left"> ViT_ImNet FAME2 pretraing</td>
+<td align="center"><a href="https://drive.google.com/file/d/1rMg_U6mA3SBb-y_SvO0WHowFp6KkmzOQ/view?usp=sharing">download</a></td>
 </tr>
 </tbody></table>
 
-2. Organise your data into this directory structure (Public datasets used in this study can be [downloaded here](BENCHMARK.md))
+2. Organise your data into this directory structure 
 
 ```
 ├── data folder
     ├──train
-        ├──class_a
-        ├──class_b
-        ├──class_c
+        ├──VOCE_0
+        ├──VOCE_1
     ├──val
-        ├──class_a
-        ├──class_b
-        ├──class_c
+        ├──VOCE_0
+        ├──VOCE_1
     ├──test
-        ├──class_a
-        ├──class_b
-        ├──class_c
+        ├──VOCE_0
+        ├──VOCE_1
 ``` 
 
-3. Start fine-tuning (use IDRiD as example). A fine-tuned checkpoint will be saved during training. Evaluation will be run after training.
+3. Start fine-tuning. Here is an example of the finetune of the Fusion Model on FOLD_1
 
 
 ```
-python -m torch.distributed.launch --nproc_per_node=1 --master_port=48798 main_finetune.py \
-    --batch_size 16 \
-    --world_size 1 \
+python main_finetune.py \
     --model vit_large_patch16 \
-    --epochs 50 \
-    --blr 5e-3 --layer_decay 0.65 \
-    --weight_decay 0.05 --drop_path 0.2 \
-    --nb_classes 5 \
-    --data_path ./IDRiD_data/ \
-    --task ./finetune_IDRiD/ \
-    --finetune ./RETFound_cfp_weights.pth \
-    --input_size 224
+    --aa rand-m9-mstd0.5-inc10 \
+    --finetune "/path/to/checkpoints/fame2/FOLD_1/Retfound_fame2_finetuned FOLD_1-best-f1.pth" \
+    --task "Retfound_fame2_finetuned FOLD_1 Fusion" \
+    --data_path "/path/to/FAME2/FOLD_1" \
+    --use_metadata 1 \
+    --freeze_backbone 1 \
+    --device cuda:1 \
+    --seed 2 \
+    --resume "" \
+    --blr 5e-3
 
 ```
 
 
-4. For evaluation only (download data and model checkpoints [here](BENCHMARK.md); change the path below)
+4. For evaluation only
 
 
 ```
-python -m torch.distributed.launch --nproc_per_node=1 --master_port=48798 main_finetune.py \
-    --eval --batch_size 16 \
-    --world_size 1 \
+python main_finetune.py \
     --model vit_large_patch16 \
-    --epochs 50 \
-    --blr 5e-3 --layer_decay 0.65 \
-    --weight_decay 0.05 --drop_path 0.2 \
-    --nb_classes 5 \
-    --data_path ./IDRiD_data/ \
-    --task ./internal_IDRiD/ \
-    --resume ./finetune_IDRiD/checkpoint-best.pth \
-    --input_size 224
+    --aa rand-m9-mstd0.5-inc10 \
+    --finetune "/path/to/checkpoints/fame2/FOLD_1/Retfound_fame2_finetuned FOLD_1-best-f1.pth" \
+    --task "Retfound_fame2_finetuned FOLD_1 Fusion" \
+    --data_path "/path/to/FAME2/FOLD_1" \
+    --use_metadata 1 \
+    --freeze_backbone 1 \
+    --device cuda:1 \
+    --seed 2 \
+    --resume "/path/to/checkpoints/fame2/FOLD_1/Retfound_fame2_finetuned FOLD_1-best-f1.pth" \
+    --blr 5e-3 \
+    --eval
 
 ```
 
@@ -135,15 +125,6 @@ model = models_vit.__dict__['vit_large_patch16'](
     global_pool=True,
 )
 
-# load RETFound weights
-checkpoint = torch.load('RETFound_cfp_weights.pth', map_location='cpu')
-checkpoint_model = checkpoint['model']
-state_dict = model.state_dict()
-for k in ['head.weight', 'head.bias']:
-    if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-        print(f"Removing key {k} from pretrained checkpoint")
-        del checkpoint_model[k]
-
 # interpolate position embedding
 interpolate_pos_embed(model, checkpoint_model)
 
@@ -159,20 +140,12 @@ print("Model = %s" % str(model))
 ```
 
 
-### 📃Citation
+## Reproducing Results
 
-If you find this repository useful, please consider citing this paper:
-```
-@article{zhou2023foundation,
-  title={A foundation model for generalizable disease detection from retinal images},
-  author={Zhou, Yukun and Chia, Mark A and Wagner, Siegfried K and Ayhan, Murat S and Williamson, Dominic J and Struyven, Robbert R and Liu, Timing and Xu, Moucheng and Lozano, Mateo G and Woodward-Court, Peter and others},
-  journal={Nature},
-  volume={622},
-  number={7981},
-  pages={156--163},
-  year={2023},
-  publisher={Nature Publishing Group UK London}
-}
-```
+All the command lines required to reproduce the results are available here:  
+
+[📥 Download Command Lines](https://drive.google.com/drive/folders/15RVi4gV-ZK_Ab0hj6Ice4WLKAJT6lIEn?usp=drive_link)
+
+
 
 
